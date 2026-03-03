@@ -110,21 +110,40 @@ class LLMToolAdapter:
         self._litellm_available = False
         self._init_litellm()
 
+    def _has_channel_config(self) -> bool:
+        """Check if multi-channel config (channels / YAML) is active."""
+        return bool(self._config.llm_model_list) and not all(
+            e.get('model_name', '').startswith('__legacy_') for e in self._config.llm_model_list
+        )
+
     def _get_api_keys_for_model(self, model: str) -> List[str]:
-        """Return API keys for the given litellm model based on provider prefix."""
+        """Return API keys for the given litellm model (legacy path only)."""
         config = self._config
         if model.startswith("gemini/") or model.startswith("vertex_ai/"):
             return [k for k in config.gemini_api_keys if k and len(k) >= 8]
         if model.startswith("anthropic/"):
             return [k for k in config.anthropic_api_keys if k and len(k) >= 8]
-        # openai/, deepseek/, or any other provider uses openai_api_keys
-        return [k for k in config.openai_api_keys if k and len(k) >= 8]
+        # DeepSeek models: check dedicated keys first, fall back to openai keys
+        _model_lower = model.lower()
+        if 'deepseek' in _model_lower:
+            ds_keys = [k for k in config.deepseek_api_keys if k and len(k) >= 8]
+            if ds_keys:
+                return ds_keys
+        if model.startswith("openai/") or "/" not in model:
+            return [k for k in config.openai_api_keys if k and len(k) >= 8]
+        # Other LiteLLM-native providers – API key from env
+        return []
 
     def _extra_litellm_params(self, model: str) -> dict:
-        """Build extra litellm params (api_base, custom headers) for a model."""
+        """Build extra litellm params (legacy path only)."""
         config = self._config
         params: Dict[str, Any] = {}
-        if not model.startswith("gemini/") and not model.startswith("anthropic/") and not model.startswith("vertex_ai/"):
+        # DeepSeek dedicated keys → use DeepSeek API base
+        _model_lower = model.lower()
+        if 'deepseek' in _model_lower and config.deepseek_api_keys:
+            params["api_base"] = "https://api.deepseek.com/v1"
+            return params
+        if model.startswith("openai/") or "/" not in model:
             if config.openai_base_url:
                 params["api_base"] = config.openai_base_url
             if config.openai_base_url and "aihubmix.com" in config.openai_base_url:
@@ -132,23 +151,44 @@ class LLMToolAdapter:
         return params
 
     def _init_litellm(self) -> None:
-        """Initialize litellm Router for multi-key, or flag single-key availability."""
+        """Initialize litellm Router from channels / YAML / legacy keys."""
         config = self._config
         litellm_model = config.litellm_model
         if not litellm_model:
             logger.warning("Agent LLM: LITELLM_MODEL not configured")
             return
 
-        keys = self._get_api_keys_for_model(litellm_model)
-        if not keys:
-            logger.warning(f"Agent LLM: No API keys found for model {litellm_model}")
+        self._litellm_available = True
+
+        # --- Channel / YAML path ---
+        if self._has_channel_config():
+            model_list = config.llm_model_list
+            self._router = Router(
+                model_list=model_list,
+                routing_strategy="simple-shuffle",
+                num_retries=2,
+            )
+            unique_models = list(dict.fromkeys(
+                e['litellm_params']['model'] for e in model_list
+            ))
+            logger.info(
+                f"Agent LLM: Router initialized from channels/YAML — "
+                f"{len(model_list)} deployment(s), models: {unique_models}"
+            )
             return
 
-        self._litellm_available = True
+        # --- Legacy path ---
+        keys = self._get_api_keys_for_model(litellm_model)
+        if not keys:
+            logger.info(
+                f"Agent LLM: litellm initialized (model={litellm_model}, "
+                f"API key from environment)"
+            )
+            return
 
         if len(keys) > 1:
             extra_params = self._extra_litellm_params(litellm_model)
-            model_list = [
+            legacy_model_list = [
                 {
                     "model_name": litellm_model,
                     "litellm_params": {
@@ -160,12 +200,14 @@ class LLMToolAdapter:
                 for k in keys
             ]
             self._router = Router(
-                model_list=model_list,
+                model_list=legacy_model_list,
                 routing_strategy="simple-shuffle",
                 num_retries=2,
             )
-            models_in_router = list(dict.fromkeys(m["litellm_params"]["model"] for m in model_list))
-            logger.info(f"Agent LLM: Router initialized with {len(keys)} keys for {litellm_model} (models: {models_in_router})")
+            logger.info(
+                f"Agent LLM: Legacy Router initialized with {len(keys)} keys "
+                f"for {litellm_model}"
+            )
         else:
             logger.info(f"Agent LLM: litellm initialized (model={litellm_model})")
 
@@ -246,9 +288,15 @@ class LLMToolAdapter:
             call_kwargs["tools"] = tools
 
         # Use Router for primary model (multi-key), direct litellm for others
-        if self._router and model == self._config.litellm_model:
+        use_channel_router = self._has_channel_config()
+        if use_channel_router and self._router:
+            # Channel / YAML path: Router manages all models
+            response = self._router.completion(**call_kwargs)
+        elif self._router and model == self._config.litellm_model:
+            # Legacy path: Router for primary model multi-key
             response = self._router.completion(**call_kwargs)
         else:
+            # Legacy path: direct call for fallback/other models
             keys = self._get_api_keys_for_model(model)
             if keys:
                 call_kwargs["api_key"] = keys[0]
